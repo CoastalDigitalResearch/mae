@@ -14,8 +14,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Vibe OS",
-  description: "Next.js app with Claude Code integration",
+  title: "mae",
+  description: "Minimal Agentic Environment",
 };
 
 export default function RootLayout({

@@ -7,10 +7,25 @@ import type {
 import {
   createUIMessageStream,
   createUIMessageStreamResponse,
+  streamText,
   type UIMessage,
 } from "ai";
+import { getProviderConfig, getLanguageModel } from "@/lib/providers";
 
-export const maxDuration = 60000; // 60 seconds
+export const maxDuration = 60000;
+
+const MAE_SYSTEM_PROMPT = `You are mae, an AI agent running on this Linux system.
+Your job is to keep this machine updated, configured, and secure.
+You have terminal access to the host system.
+
+You have access to all mcp servers via mcp binary.
+
+Example:
+bunx mcp @modelcontextprotocol/server-puppeteer -- puppeteer_screenshot shot.png | jq -r '.content[1].data'
+bunx mcp @modelcontextprotocol/server-filesystem -a '~/Desktop' -- list_directory '~/Desktop'
+
+To read each mcp server's tools, run:
+bunx mcp @modelcontextprotocol/server-puppeteer help`;
 
 function buildPromptFromContentBlocks(
   blocks: ContentBlockParam[]
@@ -25,25 +40,17 @@ function buildPromptFromContentBlocks(
       if (block.type === "text") {
         return {
           type: "user",
-          message: {
-            role: "user",
-            content: [{ type: "text", text: block.text }],
-          },
+          message: { role: "user", content: [{ type: "text", text: block.text }] },
           parent_tool_use_id: null,
         } as SDKUserMessage;
       }
-      // Handle image blocks
       return {
         type: "user",
-        message: {
-          role: "user",
-          content: [block],
-        },
+        message: { role: "user", content: [block] },
         parent_tool_use_id: null,
       } as SDKUserMessage;
     });
 
-  // Return the messages as an async iterable or handle appropriately
   return (async function* () {
     for (const message of messages) {
       yield message;
@@ -53,23 +60,38 @@ function buildPromptFromContentBlocks(
 
 export async function POST(req: Request) {
   const { messages }: { messages: UIMessage[] } = await req.json();
-
-  // Get the last user message
   const lastMessage = messages[messages.length - 1];
 
   console.log("[chat/route] received message:", lastMessage);
 
-  // Build prompt with support for images and text
+  const config = getProviderConfig();
+  console.log("[chat/route] provider:", config.provider, "model:", config.model);
+
+  // Non-anthropic providers: use Vercel AI SDK streamText
+  if (config.provider !== "anthropic") {
+    const model = await getLanguageModel(config);
+
+    const result = streamText({
+      model,
+      system: MAE_SYSTEM_PROMPT,
+      messages: messages.map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.parts
+          .filter((p) => p.type === "text")
+          .map((p) => (p as { type: "text"; text: string }).text)
+          .join(""),
+      })),
+    });
+
+    return result.toTextStreamResponse();
+  }
+
+  // Anthropic: use Claude Code SDK query() path
   const contentBlocks: ContentBlockParam[] = [];
 
   for (const part of lastMessage.parts) {
-    console.log("[chat/route] processing part:", part.type);
-
     if (part.type === "text") {
-      const textBlock: TextBlockParam = {
-        type: "text",
-        text: part.text,
-      };
+      const textBlock: TextBlockParam = { type: "text", text: part.text };
       contentBlocks.push(textBlock);
     } else if (
       part.type === "file" &&
@@ -90,98 +112,35 @@ export async function POST(req: Request) {
     }
   }
 
-  console.log(
-    "[chat/route] content blocks to send:",
-    JSON.stringify(contentBlocks).slice(0, 200)
-  );
-
-  // For backward compatibility, if only text parts exist, use a simple string
   const prompt = buildPromptFromContentBlocks(contentBlocks);
-
-  // Track session for conversation continuity
-  const sessionId = messages.length > 1 ? "chat-session" : undefined;
   const continueSession = messages.length > 1;
 
-  // Create the stream first
   const stream = createUIMessageStream({
     execute: async (options) => {
       const { writer } = options;
 
       const claudeOptions: Options = {
-        appendSystemPrompt: `
-          You are vibeOS, a chat assistant running in a Next.js application directory. You have root access to hardware (you are running in a macOS sandbox environment).
-          
-          You have access to all mcp servers via mcp binary
-
-          Example:
-          bunx mcp @modelcontextprotocol/server-puppeteer -- puppeteer_screenshot shot.png | jq -r '.content[1].data'
-          bunx mcp @modelcontextprotocol/server-filesystem -a '~/Desktop' -- list_directory '~/Desktop'
-
-          To read each mcp server tools, just run:
-          bunx mcp @modelcontextprotocol/server-puppeteer help
-          `,
-
+        appendSystemPrompt: MAE_SYSTEM_PROMPT,
         permissionMode: "bypassPermissions",
       };
 
-      // handle session continuation
       if (continueSession) {
         claudeOptions.continue = true;
-      } else if (sessionId) {
-        claudeOptions.resume = sessionId;
       }
 
-      for await (const message of query({
-        prompt: prompt,
-        options: claudeOptions,
-      })) {
+      for await (const message of query({ prompt, options: claudeOptions })) {
         console.log("[chat/route] received message:", message.type);
 
         if (message.type === "assistant" && message.message?.content) {
-          writer.write({
-            type: "text-start",
-            id: "0",
-          });
+          writer.write({ type: "text-start", id: "0" });
 
           for (const part of message.message.content) {
             if (part.type === "text") {
-              // Stream each text chunk as it arrives
-              writer.write({
-                type: "text-delta",
-                delta: part.text,
-                id: "0",
-              });
+              writer.write({ type: "text-delta", delta: part.text, id: "0" });
             }
           }
 
-          writer.write({
-            type: "text-end",
-            id: "0",
-          });
-        } else {
-          // TODO: deal with user and system messages LATER.
-          // writer.write({
-          //   type: "text-start",
-          //   id: "0",
-          // });
-          // if (message.type === "user") {
-          //   writer.write({
-          //     type: "text-delta",
-          //     delta: message.message?.content?.[0]?.text || "no content",
-          //     id: "0",
-          //   });
-          // }
-          // if (message.type === "system") {
-          //   writer.write({
-          //     type: "text-delta",
-          //     delta: message.cwd,
-          //     id: "0",
-          //   });
-          // }
-          // writer.write({
-          //   type: "text-end",
-          //   id: "0",
-          // });
+          writer.write({ type: "text-end", id: "0" });
         }
       }
 
@@ -189,8 +148,5 @@ export async function POST(req: Request) {
     },
   });
 
-  // Return the response
-  return createUIMessageStreamResponse({
-    stream: stream,
-  });
+  return createUIMessageStreamResponse({ stream });
 }
