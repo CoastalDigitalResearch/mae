@@ -41,3 +41,5 @@ yarn-error.log*
 next-env.d.ts
 .worktrees/
 mae.config.json
+
+package-lock.json
